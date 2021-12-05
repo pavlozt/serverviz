@@ -1,0 +1,360 @@
+#!/usr/bin/env python
+# -*- coding: utf8 -*-
+"""
+serverviz - linux graphical inventory 
+
+This program creates a graphical representation of resources and virtual machines in Dot format.
+
+"""
+
+__version__ = "0.1"
+
+import argparse
+import json
+import logging
+import os
+import platform
+import re
+import subprocess
+import sys
+from datetime import datetime
+
+global args, log
+
+
+def process_args():
+    global args
+    parser = argparse.ArgumentParser(
+        description='This program creates a graphical representation of resources and virtual machines in Graphviz Dot format')
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("-c", '--collect-only', action="store_true",
+                       help="Collect JSON-inventory and output to stdout. You can  save file and draw graph later on another machine where dot program installed")
+    group.add_argument("-i", '--input-inventory', action="store_true",
+                       help="Use stdin as JSON-inventory input")
+
+    parser.add_argument("-o",'--output-format',  type=str, default='dot',
+                       help="Output format. Any format than dot program supports - svg, pdf, png. And you can use dot as output")                       
+    parser.add_argument("-v", "--verbose", dest="verbosity", action="count", default=0,
+                        help="Verbosity (between 1-4 occurrences with more leading to more "
+                        "verbose logging). CRITICAL=0, ERROR=1, WARN=2, INFO=3, "
+                        "DEBUG=4")
+
+    sens_parser = parser.add_mutually_exclusive_group(required=False)
+    sens_parser.add_argument('-s','--sensitive', dest='sensitive', action='store_true',
+                        help="Collect sensitive data. Such as disk serial numbers, domain names, etc. Enabled by default")
+    sens_parser.add_argument('--no-sensitive', dest='sensitive', action='store_false',
+                        help="Does not collect sensitive data")
+    parser.set_defaults(sensitive=True)
+
+    
+    parser.add_argument('-V', '--version', action='version',
+                        version="%(prog)s " + __version__)
+
+    args = parser.parse_args()
+
+
+def check_os_supported():
+    """ проверка платформы. """
+    log.debug('platform:%s', platform.platform())
+    if not platform.system() == 'Linux':
+        raise NotImplementedError('Unsupported OS')
+
+
+def setup_logging():
+    log_levels = {
+        0: logging.CRITICAL,
+        1: logging.ERROR,
+        2: logging.WARN,
+        3: logging.INFO,
+        4: logging.DEBUG,
+    }
+    module = sys.modules["__main__"].__file__
+    log = logging.getLogger(module)
+    logging.basicConfig(level=log_levels[min(
+        args.verbosity, max(log_levels.keys()))])
+    return log
+
+def get_os_output(shell_list):
+    log.debug('exec shell command %s ', shell_list)
+    try :
+        return subprocess.check_output(shell_list).decode()
+    except subprocess.CalledProcessError:
+            return None
+
+        
+
+
+
+def collect_mounts():
+    """ collect  findmnt output """
+    # this function filter out special devices. We need some special filter list
+    filtered_devnames = ['/dev/fuse']
+
+    mounts = {}
+    # TODO еще один запуск с ключами попроще без use%
+    mounts_txt = get_os_output(['findmnt','-lo','source,target,fstype,options,size,used,use%,maj:min'])
+
+    lines = mounts_txt.split("\n")
+    firstline = lines.pop(0)
+    # проверяем похожи ли данные на правильно сработавшую команду
+    if re.match(r"SOURCE.+TARGET.+FSTYPE", firstline):
+        for line in lines :
+            if line.startswith('/dev/'):
+                    # TODO можно бы сделать парсинг LABEL, но встречаются файловые системы без метки. алгоритм получился бы  сложнее.
+                    # сейчас просто не пытаемся собрать данные LABEL и парсинг прост.
+                    source, target, fstype, options, size, used_size, used_proc, maj_min, etc = re.split('\s+', line)
+                    if not (source in filtered_devnames):
+                        mounts[target] = {
+                            'name': target,
+                            'linked_to': source,
+                            'size': size,
+                            'fstype': fstype,
+                            'used_size': used_size,
+                            'used_proc': used_proc,
+                            'maj_min':  maj_min
+                        }
+    else:
+        log.warning("findmnt not recognized")
+
+    return mounts
+
+def collect_machine_id():
+    # данные о сервере
+    uname  = os.uname()
+    if args.sensitive :
+        machine_text = ' '.join(uname[0:3])
+    else:
+        machine_text = ' '.join((uname[0],uname[2]))
+    machine_time = datetime.now().strftime('%Y-%m-%d %H:%M')    
+    return (machine_text,machine_time)
+
+def collect_lsblk():
+    """ collect lsblk output (as JSON)  """
+    # this works only modern lsblk versions which supports -J option
+    # TODO Need workaround for old lsblk. Really?
+    lsblk_output = get_os_output(['lsblk','-OJ'])
+    if lsblk_output and re.match(r".+\"blockdevices\": \[", lsblk_output,re.DOTALL):    
+        lsblk = json.loads(lsblk_output)
+        if not args.sensitive:
+            lsblk = clean_private_keys(lsblk)
+        return lsblk
+    else:
+        log.warning('lsblk json not recognized. Too old linux?')
+        return {}   
+
+
+
+sensitive_attrs = ['serial','ptuuid','label','uuid','wwn']
+
+def clean_private_keys(d):
+    """ рекурсивная зачистка некоторых атрибутов """
+    if isinstance(d, dict):        
+        return { k: clean_private_keys(v) if k not in sensitive_attrs else None for k, v in d.items()}
+    elif isinstance(d, list):
+        return [clean_private_keys(v) for v in d]
+    else:
+        return d
+
+
+def input_json_inventory():
+    """ use stdin insead directly collect data """
+    stdin_string = sys.stdin.read()
+    # TODO обработка ошибок формата файла
+    jsonobj = json.loads(stdin_string)
+    inventory = jsonobj['serverviz_inventory']
+    if not args.sensitive:
+        return clean_private_keys(inventory)     
+    return inventory
+
+
+def output_json_inventory(inventory):
+    """ output data as json """
+    inventory_for_json = {
+        'serverviz_inventory' : inventory
+    }
+    print(json.dumps(inventory_for_json))
+
+def exec_dot_draw(info_block,output_format):
+    """ функция по заполненой структуре формирует файл формата DOT  """
+    print("executing dot -T{} ... ".format(output_format))
+    
+def construct_graph_data(inventory):
+    """ 
+    Построить все списки и прочие нужные переменные для формирования графа на основе данных инвентаризации.
+    Возвращает данные другой структуры для отрисовки в терминах нотации dot.  
+    """
+
+    def inspect_lslbk_json(data,level,parent_name=None):
+        """ recursive json parsing """
+
+        for device in data:
+            device_idname = device['path']  # уникальное имя в рамках графа
+            device_serial_txt =''
+            if device['serial']:
+                device_serial_txt = '<br/>sn: {}'.format(device['serial'])
+            
+            device_record = {
+                'name' : device_idname,                
+                'text': '<font point-size="20">{} </font> <br/> {} <br/> {}  {}'.format(
+                            device_idname,
+                            str(device['model'] or ''),device['size'],device_serial_txt),
+                'shape': 'record',
+                'level': level
+             }
+            # пропускаем loop mounts. Хотя не исключено что они нужны
+            if device['kname'].startswith('loop') :
+                continue
+
+            # для вращающихся магнитных дисков первые два уровня рисуем цилиндрами , а далее уже блоками (shape = record)
+            if device['rota'] and level <=  2 :
+                device_record['shape']='cylinder'
+                
+            # для второго уровня заполняем siblings чтобы разделы дисков показывались рядом со своими физическими братьями
+            if level == 2 :
+                if parent_name not in siblings:
+                    siblings[parent_name] = []
+                siblings[parent_name].append(device_idname)
+
+
+            item_data[device['path']]=device_record
+            # при отсутствии списка нужного уровня, создать пустой
+            if level not in levels_data :
+                levels_data[level] = []
+            # сохранить все встреченное на одном уровне     
+            levels_data[level].append(device_idname)
+            # создать ссылку на этот элемент от родителя, если это приемлемо (не на верхнем уровне)
+            if not parent_name  is None :
+                linktext = '"{}" -> "{}"'.format(parent_name,device_idname)
+                links.add(linktext)
+
+            if 'children' in device :
+                inspect_lslbk_json(device['children'],level+1,device_idname) # recursive call
+
+    
+    
+    log.debug('processing graph data')
+    # эти переменные будут заполнены данными из lsblk 
+    item_data = {} # map of records with device parameters
+    levels_data = {} # map  of list with device names  
+    links = set() # links from -> to
+    siblings = {} #  набор блоков, которые нужно при отрисовке показать рядом. в терминах dot это subgraph
+    
+    if inventory['lsblk']:
+        log.debug('processing lsblk data')
+        inspect_lslbk_json(inventory['lsblk']['blockdevices'],level=1)
+
+    dotinventory = inventory.copy() # for good luck
+    dotinventory['item_data'] = item_data
+    dotinventory['levels_data'] = levels_data
+    dotinventory['links'] = links
+    dotinventory['siblings'] = siblings
+    
+    return dotinventory
+
+def convert_to_dot(info_block):
+    """ функция по заполненой структуре формирует файл формата DOT  """
+
+    log.debug('making dot')
+    timestamptext = info_block['machine_time']
+    machine_text = info_block['machine_text']
+
+    s= '''
+digraph storage {{
+labelloc="t";
+label=< 
+<font point-size="40"> Resources on {machine_text} <br/> collected at {timestamptext} </font> 
+>;
+rankdir=LR;
+node  [shape="record"] ;
+'''.format(machine_text=machine_text,timestamptext=timestamptext)
+    # все названия в языке DOT придется экранировать кавчыками. Слеш / в названии /dev/sda не допускается
+    # Формируем ноды
+    for node in info_block['item_data']:
+        s += '"{}" [label=<\n{}\n> shape={}  ]; \n'.format(node,info_block['item_data'][node]['text'],info_block['item_data'][node]['shape'])
+    # Формируем линки
+    for link in info_block['links']:
+        s += link + ";\n"
+
+    # rank  конфликтуют с subgraph.  нельзя использовать их вместе.
+    # рисуем все кроме второго уровня, который использует subgraphs   
+    for level in info_block['levels_data']:
+        if level != 2 :
+            s += "{ rank=same "
+            s += '  '.join(['"{}"'.format(c) for c in info_block['levels_data'][level]])
+            s += "} \n"
+
+    # рисуем рамки в виде subgraph , если их там больше одного.
+    for parent_name in info_block['siblings']:
+        if len(info_block['siblings'][parent_name])>1:
+            s += 'subgraph "cluster_' + parent_name + '"  \
+            { label="partitions" ;  graph[style=dotted]; '
+            s += '  '.join(['"{}"'.format(c) for c in info_block['siblings'][parent_name]])
+            s  += "}\n"
+    
+    # здоровый блок mounted filesystems            
+    mounts = info_block['mounts']
+    # для каждого  mount Не забываем создать связи
+    for mname in mounts :
+        s += '"{}" -> "{}"'.format(mounts[mname]['linked_to'],mname)        
+    # создаем особую визуализацию этого типа блока
+    for mname in mounts:
+        s += '"{}" [label=<\n{}<br/>{} , {} used > shape=record  ]; \n'.format(mname,mname,mounts[mname]['size'],mounts[mname]['used_proc'])
+           
+    
+    # И обрамляющий блок-subgraph    
+
+    s += 'subgraph "cluster_mounts" { label="Mounted filesystems";  fontsize="40" graph[style=dotted]; '        
+    s += '  '.join(['"{}"'.format(c) for c in mounts])
+    s += '}'
+    # TODO ЗДЕСЬ должны быть дополнительные визуализации PVE
+    #  
+    # конец графа    
+    s += '}'
+    return s            
+
+if __name__ == "__main__":
+    process_args()
+    log = setup_logging()
+    check_os_supported()
+    # по семантике ключи могут быть 
+    #  - с - выполнить только сбор без запуска dot
+    # - не выполнять сбор, использовать json
+    # 
+    #  по-умолчанию выполняется  и сбор   и вывод
+
+    # активный сбор информации
+    log.debug('arguments sensitive collect %s',args.sensitive)
+
+    if not args.input_inventory: 
+        mounts = collect_mounts()
+        machine_text,machine_time = collect_machine_id()
+        lsblk = collect_lsblk()
+        inventory = {
+            'mounts' : mounts,
+            'machine_text': machine_text,
+            'machine_time': machine_time,
+            'lsblk' : lsblk
+
+        }
+        # etc collections
+
+        # pve storages
+        # pve ct
+    else : # те же переменные конструруются из stdin
+        inventory=input_json_inventory()
+
+    
+    info_block = construct_graph_data(inventory)
+    
+    # нужно ли создавать dot ?
+    if args.collect_only :
+        output_json_inventory(inventory)
+    else :
+        dotstr=convert_to_dot(info_block)
+        # нужно ли запускать dot для формирования выходных картинок?
+        if args.output_format != 'dot'  :
+            exec_dot_draw(dotstr,args.output_format)
+        else:
+            print(dotstr)    
+        
+
