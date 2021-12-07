@@ -161,7 +161,10 @@ def input_json_inventory():
     stdin_string = sys.stdin.read()
     # TODO обработка ошибок формата файла
     jsonobj = json.loads(stdin_string)
-    inventory = jsonobj['serverviz_inventory']
+    if 'serverviz_inventory' in jsonobj :
+        inventory = jsonobj['serverviz_inventory']
+    else :
+        raise  ValueError('incorrect inventory file')
     if not args.sensitive:
         return clean_private_keys(inventory)     
     return inventory

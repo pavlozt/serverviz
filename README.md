@@ -9,9 +9,9 @@ Works with python2 and does need any depended packages installation. Simple down
 
 ```curl https://raw.githubusercontent.com/pavlozt/serverviz/master/serverviz >serverviz ```
 
-and run it:
+and run it (sudo  is necessary for the collection of information to work )
 
-```./serverviz > server_graph.dot ```
+```sudo ./serverviz > server_graph.dot ```
 
 To display DOT you must produce, for example pdf : 
 
