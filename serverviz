@@ -142,6 +142,36 @@ def collect_lsblk():
         log.warning('lsblk json not recognized. Too old linux?')
         return {}   
 
+def collect_pve_data():
+    """ сбор данных PVE 
+    одна функция собирает весь набор
+
+    для первой итерации достаточно пройтись по всем storage , получить записи определенных типов
+    и собрать уникальные vmid
+
+    Однако mountpoints при этом не собираются. все хитрые варианты не отрисуются.
+    
+    нужны все конфиги всех виртуалок и все ссылающиеся из них rootfs, mp[\d+]
+    причем в виртуалки диски бывают добавлены как virtio[\d+] 
+    TODO а так же надо сконфигурить и  проверить другие варианты
+    """
+    nodename = os.uname()[1]
+    nodeprefix = "/nodes/"+ nodename
+    #pve_storages =   = json.loads(get_os_output(['pvesh','get',nodeprefix + "/storage", '--output-format','json']))
+    pve_storages  = json.loads(get_os_output(['cat','test-data/inventory-examples/server2/pve-storage.json']))
+
+    #pve_lxc =   = json.loads(get_os_output(['pvesh','get',nodeprefix + "/lxc", '--output-format','json']))
+    pve_lxc  = json.loads(get_os_output(['cat','test-data/inventory-examples/server2/pve-lxc.json']))
+
+    #pve_qemu    = json.loads(get_os_output(['pvesh','get',nodeprefix + "/qemu", '--output-format','json']))
+    pve_qemu  = json.loads(get_os_output(['cat','test-data/inventory-examples/server2/pve-qemu.json']))
+
+    for container in pve_lxc :
+        print('id : ' + container['vmid'])
+        #container_config    = json.loads(get_os_output(['pvesh','get',nodeprefix + "/lxc" + container['vmid'] + '/config', '--output-format','json']))
+        container_config    = json.loads(get_os_output(['cat','test-data/inventory-examples/server2/lxc-' + container['vmid'] + '.json']))
+        print (container_config )
+        
 
 
 sensitive_attrs = ['serial','ptuuid','label','uuid','wwn']
@@ -310,6 +340,7 @@ node  [shape="record"] ;
     s += '  '.join(['"{}"'.format(c) for c in mounts])
     s += '}'
     # TODO ЗДЕСЬ должны быть дополнительные визуализации PVE
+    
     #  
     # конец графа    
     s += '}'
@@ -332,6 +363,14 @@ if __name__ == "__main__":
         mounts = collect_mounts()
         machine_text,machine_time = collect_machine_id()
         lsblk = collect_lsblk()
+    
+        # pve storages
+        pvedata = collect_pve_data()
+        pve_storage = pvedata['pve_storage']
+        pve_mountpoint = pvedata['pve_mountpoint']
+        pve_container = pvedata['pve_container']
+        pve_vm = pvedata['pve_vm']
+
         inventory = {
             'mounts' : mounts,
             'machine_text': machine_text,
@@ -339,10 +378,6 @@ if __name__ == "__main__":
             'lsblk' : lsblk
 
         }
-        # etc collections
-
-        # pve storages
-        # pve ct
     else : # те же переменные конструруются из stdin
         inventory=input_json_inventory()
 
